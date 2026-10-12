@@ -2,7 +2,55 @@ import subprocess
 import tempfile
 import json
 import os
+import re
 from typing import Dict, Any, List, Optional
+from urllib.parse import urlparse
+
+_HEADER_KEY_RE = re.compile(r"^[A-Za-z0-9-]+$")
+
+
+def _validate_target_url(target_url: str) -> str:
+    """Validate target_url to prevent CLI argument injection (CWE-78).
+
+    Raises ValueError on any unsafe input; never silently sanitizes.
+    """
+    if not isinstance(target_url, str) or not target_url:
+        raise ValueError("target_url must be a non-empty string")
+    if any(ord(c) < 32 or ord(c) == 127 for c in target_url):
+        raise ValueError("target_url contains control characters")
+    if any(c.isspace() for c in target_url):
+        raise ValueError("target_url contains whitespace")
+    if target_url.startswith("-"):
+        raise ValueError("target_url must not start with '-'")
+    parsed = urlparse(target_url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("target_url must use http or https scheme")
+    if not parsed.hostname:
+        raise ValueError("target_url must include a hostname")
+    return target_url
+
+
+def _validate_headers(headers: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Validate header keys/values to prevent CLI argument injection (CWE-78).
+
+    Raises ValueError on any unsafe input; never silently sanitizes.
+    """
+    if headers is None:
+        return None
+    if not isinstance(headers, dict):
+        raise ValueError("headers must be a dict")
+    for k, v in headers.items():
+        if not isinstance(k, str) or not _HEADER_KEY_RE.match(k):
+            raise ValueError(f"invalid header key: {k!r}")
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"invalid header value for key {k!r}")
+        if v.startswith("-"):
+            raise ValueError(f"header value for key {k!r} must not start with '-'")
+        if any(ord(c) < 32 or ord(c) == 127 for c in v):
+            raise ValueError(f"header value for key {k!r} contains control characters")
+        if any(c.isspace() for c in v):
+            raise ValueError(f"header value for key {k!r} contains whitespace")
+    return headers
 
 
 def run_nuclei(
@@ -13,6 +61,10 @@ def run_nuclei(
     """
     Run Nuclei DAST scan (safe by default).
     """
+
+    # ---- INPUT VALIDATION (fail closed, CWE-78) ----
+    target_url = _validate_target_url(target_url)
+    headers = _validate_headers(headers)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl") as tmp:
         output_path = tmp.name
