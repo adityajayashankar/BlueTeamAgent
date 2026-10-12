@@ -29,6 +29,48 @@ from sast.scope import (
     ScopeViolation,
 )
 
+import re
+
+# Allowlist: https:// git URLs or git@ SSH refs only. No whitespace, no
+# option-like leading dashes, no shell metacharacters.
+_REPO_URL_RE = re.compile(
+    r"^(https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%\-]+"
+    r"|git@[A-Za-z0-9._\-]+:[A-Za-z0-9._~/\-]+)$"
+)
+
+
+def validate_repo_input(repo_input: str) -> None:
+    """
+    Validate a repository reference before it is used in a git clone or as a
+    filesystem path. Raises ValueError on any input that could enable git
+    argument injection (CWE-78) or path traversal (CWE-22).
+    """
+    if not isinstance(repo_input, str) or not repo_input.strip():
+        raise ValueError("repo_input must be a non-empty string")
+    if repo_input != repo_input.strip():
+        raise ValueError("repo_input must not have leading/trailing whitespace")
+    if any(c.isspace() for c in repo_input):
+        raise ValueError("repo_input must not contain whitespace")
+    if repo_input.startswith("-"):
+        raise ValueError("repo_input must not start with a dash (option injection)")
+    if not _REPO_URL_RE.match(repo_input):
+        raise ValueError(
+            "repo_input must be a valid https:// git URL or git@ SSH reference"
+        )
+
+
+def ensure_path_containment(repo_path: str, workspace_root: str) -> str:
+    """
+    Canonicalize repo_path and verify it remains inside workspace_root.
+    Blocks path traversal ('..') and symlink escapes (CWE-22). Returns the
+    canonicalized path on success; raises ValueError otherwise.
+    """
+    real = os.path.realpath(repo_path)
+    root = os.path.realpath(workspace_root)
+    if real != root and not real.startswith(root + os.sep):
+        raise ValueError(f"path escapes workspace root: {repo_path}")
+    return real
+
 # ============================================================
 # Workspace resolution (TEMP local execution adapter)
 # ============================================================
@@ -37,12 +79,15 @@ def resolve_repo(repo_input: str) -> tuple[str, bool]:
     TEMP: Local execution adapter.
     In prod, code will already be checked out by CI.
     """
+    # [FIX CWE-78] Validate repo_input before it reaches the git subprocess.
+    validate_repo_input(repo_input)
     if repo_input.startswith("http"):
         temp_dir = tempfile.mkdtemp(prefix="deplai-repo-")
         try:
             # [FIX] Removed DEVNULL, added capture_output=True to see errors
+            # [FIX CWE-78] '--' terminates git option parsing for the URL.
             subprocess.run(
-                ["git", "clone", "--depth=1", repo_input, temp_dir],
+                ["git", "clone", "--depth=1", "--", repo_input, temp_dir],
                 check=True,
                 capture_output=True, # Captures stdout/stderr
                 text=True            # Decodes to string
@@ -117,6 +162,37 @@ def run_security_checks(
     languages: List[str] = input.get("languages", ["python"])
 
     # --------------------------------------------------------
+    # [FIX CWE-78/CWE-22] EARLY REPO INPUT VALIDATION
+    # Reject malformed/option-like repo inputs before any scope,
+    # clone, or path resolution happens.
+    # --------------------------------------------------------
+    if repo_input:
+        try:
+            validate_repo_input(repo_input)
+        except ValueError as e:
+            return {
+                "run_id": run_id,
+                "status": "blocked",
+                "tools": [],
+                "findings": [
+                    Finding(
+                        category="SYSTEM",
+                        tool="scope",
+                        rule_id="repo-input-validation-failed",
+                        title="Repository input failed validation",
+                        severity="LOW",
+                        confidence="HIGH",
+                        file="scope",
+                        line_start=0,
+                        line_end=None,
+                        fingerprint=f"scope:repo-input:{hash(str(e))}",
+                        occurrences=1,
+                        evidence={"error": str(e)},
+                    )
+                ],
+            }
+
+    # --------------------------------------------------------
     # BACKWARD COMPATIBILITY (legacy / tests)
     # --------------------------------------------------------
     if plan is None:
@@ -138,10 +214,12 @@ def run_security_checks(
         # [CRITICAL FIX] "The Nuclear Option"
         # Allowed Domains = ["*"] means allow EVERYTHING.
         # Safe Mode = False means disable strict checks.
+        # [FIX] Safe default: strict mode, no wildcard domains. An omitted
+        # scope must not silently disable validation.
         scope = ScopePolicy(
             allowed_repo_prefixes=[""],
-            allowed_domains=["*"], 
-            safe_mode=False,
+            allowed_domains=[],
+            safe_mode=True,
         )
 
     # --------------------------------------------------------
@@ -182,7 +260,18 @@ def run_security_checks(
     if repo_input:
         try:
             repo_path, is_temp_clone = resolve_repo(repo_input)
-        except RuntimeError as e:
+            # [FIX CWE-22] Enforce workspace containment on the resolved path
+            # before it is used for listdir / tool invocations.
+            if repo_path:
+                if is_temp_clone:
+                    repo_path = ensure_path_containment(repo_path, tempfile.gettempdir())
+                else:
+                    normalized = repo_path.replace("\\", "/").split("/")
+                    if ".." in normalized:
+                        raise ValueError("repo_path must not contain '..' segments")
+                    if os.path.realpath(repo_path) != os.path.abspath(repo_path):
+                        raise ValueError("repo_path must not traverse symlinks")
+        except (RuntimeError, ValueError) as e:
              return {
                 "run_id": run_id,
                 "status": "failed",
